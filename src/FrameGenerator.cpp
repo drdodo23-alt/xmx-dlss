@@ -242,6 +242,12 @@ static bool RegionFits(const xefgd_resource_t& region, const D3D12_RESOURCE_DESC
 		uint64_t{ region.base.y } + region.size.y <= desc.Height;
 }
 
+static bool SameRegion(const xefgd_resource_t& previous, const xefgd_resource_t& current)
+{
+	return previous.base.x == current.base.x && previous.base.y == current.base.y &&
+		previous.size.x == current.size.x && previous.size.y == current.size.y;
+}
+
 static void LogRegion(const char* name, const xefgd_resource_t& region, const D3D12_RESOURCE_DESC& desc)
 {
 	Log::Info("FG input {}: texture={}x{} format={} region=({}, {}) {}x{}", name, desc.Width, desc.Height,
@@ -584,6 +590,10 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
 	auto hudless = Plugin::options.hudlessUi ? params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr) : nullptr;
+	// A back buffer alias still contains the HUD, so it cannot be used as clean scene color.
+	if (hudless == backbuffer)
+		hudless = nullptr;
+
 	auto depth = params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr);
 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
@@ -748,7 +758,15 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	context->lastInputsValid = validInputs;
 
 	// XeFG needs both frames to have hudless or neither
-	context->pairValid = validInputs && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
+	const bool compatibleHistory = validInputs && previous.valid && !reset &&
+		(frame.hudless != nullptr) == (previous.hudless != nullptr);
+	const bool matchingRegions = compatibleHistory && SameRegion(previous.data.backBuffer, data.backBuffer) &&
+		SameRegion(previous.data.depth, data.depth) && SameRegion(previous.data.motionVectors, data.motionVectors) &&
+		(!frame.hudless || SameRegion(previous.data.hudlessColor, data.hudlessColor));
+	if (compatibleHistory && !matchingRegions)
+		++timing.regionChanges;
+
+	context->pairValid = matchingRegions;
 	frame.valid = validInputs;
 }
 
@@ -834,6 +852,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 
 void FrameGenerator::InvalidateHistory()
 {
+	timing = {};
 	if (context)
 	{
 		context->pairValid = false;
@@ -841,8 +860,49 @@ void FrameGenerator::InvalidateHistory()
 	}
 }
 
+void FrameGenerator::RecordTiming(Clock::time_point start, bool newBatch, InterpolateResult result)
+{
+	using Milliseconds = std::chrono::duration<double, std::milli>;
+	const double recordMs = Milliseconds(Clock::now() - start).count();
+	if (timing.windowStart == Clock::time_point{})
+		timing.windowStart = start;
+
+	const bool generated = result == InterpolateResult::Interpolated;
+	++timing.calls;
+	timing.generated += generated;
+	timing.fallback += !generated;
+	timing.recordTotalMs += recordMs;
+	timing.recordMaxMs = std::max(timing.recordMaxMs, recordMs);
+
+	if (newBatch)
+	{
+		if (timing.previousBatch != Clock::time_point{})
+		{
+			const double interval = Milliseconds(start - timing.previousBatch).count();
+			timing.batchMinMs = timing.batchMinMs == 0.0 ? interval : std::min(timing.batchMinMs, interval);
+			timing.batchMaxMs = std::max(timing.batchMaxMs, interval);
+		}
+		timing.previousBatch = start;
+		++timing.batches;
+	}
+
+	const double seconds = std::chrono::duration<double>(start - timing.windowStart).count();
+	if (seconds < 5.0)
+		return;
+
+	Log::Info("FG timing (CPU submission): {:.1f}s, batch FPS={:.1f}, generated output FPS={:.1f}, fallback outputs={}, region changes={}, "
+		"batch interval min/max={:.2f}/{:.2f} ms, Evaluate recording mean/max={:.2f}/{:.2f} ms",
+		seconds, timing.batches / seconds, timing.generated / seconds, timing.fallback, timing.regionChanges,
+		timing.batchMinMs, timing.batchMaxMs, timing.recordTotalMs / timing.calls, timing.recordMaxMs);
+	const auto previousBatch = timing.previousBatch;
+	timing = {};
+	timing.windowStart = start;
+	timing.previousBatch = previousBatch;
+}
+
 NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params)
 {
+	const auto start = Clock::now();
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
 	auto outputReal = params.GetOr<ID3D12Resource*>("DLSSG.OutputReal", nullptr);
@@ -911,5 +971,6 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	else
 		Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
 
+	RecordTiming(start, frameIndex == 1, result);
 	return result == InterpolateResult::Failed ? NGX_FAIL : NGX_SUCCESS;
 }
