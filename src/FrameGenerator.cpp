@@ -236,20 +236,18 @@ static xefgd_resource_t Subrect(const NGXParameter& params, ID3D12Resource* reso
 	return subrect;
 }
 
-static XMFLOAT3 GetVector(const NGXParameter& params, const char* name)
+static XMFLOAT3 GetVector(const NGXParameter& params, const char* x, const char* y, const char* z)
 {
-	auto key = [name](const char* axis) { return std::format("DLSSG.{}{}", name, axis); };
-	return { params.GetOr(key("X").c_str(), 0.0f), params.GetOr(key("Y").c_str(), 0.0f),
-			 params.GetOr(key("Z").c_str(), 0.0f) };
+	return { params.GetOr(x, 0.0f), params.GetOr(y, 0.0f), params.GetOr(z, 0.0f) };
 }
 
 // XeFG's scene change detection uses the forward axis
 static void GetViewMatrix(const NGXParameter& params, float* out)
 {
-	const XMFLOAT3 pos = GetVector(params, "CameraPos");
-	const XMFLOAT3 right = GetVector(params, "CameraRight");
-	const XMFLOAT3 up = GetVector(params, "CameraUp");
-	const XMFLOAT3 forward = GetVector(params, "CameraFwd");
+	const XMFLOAT3 pos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
+	const XMFLOAT3 right = GetVector(params, "DLSSG.CameraRightX", "DLSSG.CameraRightY", "DLSSG.CameraRightZ");
+	const XMFLOAT3 up = GetVector(params, "DLSSG.CameraUpX", "DLSSG.CameraUpY", "DLSSG.CameraUpZ");
+	const XMFLOAT3 forward = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
 
 	// All zero disables XeFG's scene change detection
 	if (forward.x == 0.0f && forward.y == 0.0f && forward.z == 0.0f)
@@ -726,6 +724,13 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	if (!context || !context->pairValid)
 		return InterpolateResult::Skipped;
 
+	// Later frames reuse the work recorded for frame one of this batch.
+	if (frameIndex != context->nextFrameIndex || frameCount != context->batchFrameCount)
+	{
+		context->pairValid = false;
+		return InterpolateResult::Skipped;
+	}
+
 	outputDesc.Format = settings.format;
 	outputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 	// The game's output can live in a layout a committed UAV texture can't use
@@ -738,7 +743,10 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 				"XeFG output");
 
 		if (!context->outputs[i])
+		{
+			context->pairValid = false;
 			return InterpolateResult::Failed;
+		}
 	}
 
 	auto fill = [this](const Frame& frame, xefgd_frame_t& out)
@@ -772,7 +780,12 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	auto result = XeFG::Execute(context->handle, cmdList, params);
 
 	if (result == XEFGD_RESULT_SUCCESS)
+	{
+		++context->nextFrameIndex;
 		return InterpolateResult::Interpolated;
+	}
+
+	context->pairValid = false;
 
 	if (result > 0)
 	{
@@ -782,7 +795,6 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	}
 
 	Log::Error("XeFG Execute error: {}, frame {}/{}", result, frameIndex, frameCount);
-	context->pairValid = false;
 	return InterpolateResult::Failed;
 }
 
@@ -833,6 +845,11 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	if (frameIndex == 1)
 	{
 		CaptureRealFrame(cmdList, params);
+		if (context)
+		{
+			context->batchFrameCount = frameCount;
+			context->nextFrameIndex = 1;
+		}
 
 		Plugin::Report({ settings.width, settings.height, frameCount, settings.uiMode != XEFGD_UI_MODE_AUTO,
 			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
