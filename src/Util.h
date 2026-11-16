@@ -65,30 +65,39 @@ inline std::filesystem::path ThisModulePath()
 	return ModulePath(module);
 }
 
-inline void Barrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+inline D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
 	D3D12_RESOURCE_STATES after)
 {
-	if (before == after)
-		return;
-
 	D3D12_RESOURCE_BARRIER barrier{};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barrier.Transition.pResource = resource;
 	barrier.Transition.StateBefore = before;
 	barrier.Transition.StateAfter = after;
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	cmdList->ResourceBarrier(1, &barrier);
+	return barrier;
 }
 
-// Both resources are back in their states afterwards
+// Both resources are back in their states afterwards.
 inline void Copy(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* destination, D3D12_RESOURCE_STATES destinationState,
 	ID3D12Resource* source, D3D12_RESOURCE_STATES sourceState)
 {
-	Barrier(cmdList, destination, destinationState, D3D12_RESOURCE_STATE_COPY_DEST);
-	Barrier(cmdList, source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	if (destination == source)
+		return;
+
+	D3D12_RESOURCE_BARRIER barriers[2]{};
+	UINT count = 0;
+	if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST)
+		barriers[count++] = Transition(destination, destinationState, D3D12_RESOURCE_STATE_COPY_DEST);
+	if (sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+		barriers[count++] = Transition(source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+	if (count)
+		cmdList->ResourceBarrier(count, barriers);
 	cmdList->CopyResource(destination, source);
-	Barrier(cmdList, destination, D3D12_RESOURCE_STATE_COPY_DEST, destinationState);
-	Barrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState);
+	for (UINT i = 0; i < count; ++i)
+		std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+	if (count)
+		cmdList->ResourceBarrier(count, barriers);
 }
 
 // Typed formats for views on typeless or depth resources. 8-bit sRGB maps to UNORM, typed UAVs can't be sRGB
