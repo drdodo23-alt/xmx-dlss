@@ -5,6 +5,7 @@
 
 #include <wrl/client.h>
 
+#include <chrono>
 #include <memory>
 
 using Microsoft::WRL::ComPtr;
@@ -83,6 +84,26 @@ private:
 	void CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
 	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_DESC outputDesc,
 		uint32_t frameIndex, uint32_t frameCount);
+
+	using Clock = std::chrono::steady_clock;
+
+	struct Timing
+	{
+		Clock::time_point windowStart{};
+		Clock::time_point previousBatch{};
+		uint32_t batches = 0;
+		uint32_t calls = 0;
+		uint32_t generated = 0;
+		uint32_t fallback = 0;
+		uint32_t regionChanges = 0;
+		double recordTotalMs = 0.0;
+		double recordMaxMs = 0.0;
+		double batchMinMs = 0.0;
+		double batchMaxMs = 0.0;
+	};
+
+	void RecordTiming(Clock::time_point start, bool newBatch, InterpolateResult result);
+	Timing timing;
 
 	ComPtr<ID3D12Device> device;
 	Settings settings;
