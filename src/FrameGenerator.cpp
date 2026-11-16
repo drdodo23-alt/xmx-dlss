@@ -1,0 +1,864 @@
+#include "FrameGenerator.h"
+#include "Log.h"
+#include "MfgKernels.h"
+#include "MfgPort/Cuda/cuda_route.h"
+#include "Plugin.h"
+#include "Util.h"
+
+#include <DirectXMath.h>
+
+#include <cmath>
+#include <cwchar>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <numbers>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace DirectX;
+
+namespace
+{
+	// The optional fatbin is built from src/MfgPort/Cuda/xefg_cuda_layers.cu when CudaRoot is set.
+	// Its absence is not an error: XeFG keeps running the DXIL/DP4a programs.
+	std::vector<unsigned char> LoadCudaFatbin(const std::filesystem::path& path)
+	{
+		std::ifstream file(path, std::ios::binary);
+		if (!file)
+			return {};
+
+		std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(file)), {});
+		if (file.bad() || bytes.empty() || bytes.size() > 16 * 1024 * 1024)
+			return {};
+
+		return bytes;
+	}
+
+	void CudaRouteLog(const char* stage, const std::string& fields) noexcept
+	{
+		try
+		{
+			Log::Info("{} {}", stage, fields);
+		}
+		catch (...)
+		{
+		}
+	}
+} // namespace
+
+// States of the DLSSG resources when EvaluateFeature is called (same as dlssg-to-fsr3 assumes)
+constexpr auto BackbufferState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+constexpr auto InputState = D3D12_RESOURCE_STATE_COPY_DEST; // depth, mvecs, hudless
+constexpr auto OutputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+// What XeFG wants for its inputs, our copies always rest in this state
+constexpr auto XeFGInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+// XeFG's own XMX network, shipped in libxess_fg.dll. XeFG only picks it on Intel GPUs whose driver reports XMX
+constexpr int32_t XeFGXmxModel = 17;
+
+// The raw DXGI_FORMAT number says nothing in a log, the games' formats are worth naming
+static const char* FormatName(DXGI_FORMAT format)
+{
+	switch (format)
+	{
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+		return "R8G8B8A8_UNORM";
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+		return "R8G8B8A8_UNORM_SRGB";
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+		return "B8G8R8A8_UNORM";
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+		return "B8G8R8A8_UNORM_SRGB";
+	case DXGI_FORMAT_R10G10B10A2_UNORM:
+		return "R10G10B10A2_UNORM";
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:
+		return "R16G16B16A16_FLOAT";
+	default:
+		return "unknown format";
+	}
+}
+
+// XeFG's HDR support is R10G10B10A2_UNORM in HDR10 / BT.2100 only, scRGB (FP16) is rejected. A resource doesn't
+// carry its color space, so the format is the only hint there is: FP16 on a swap chain means scRGB HDR in practice
+static const char* HdrDescription(DXGI_FORMAT format)
+{
+	switch (format)
+	{
+	case DXGI_FORMAT_R10G10B10A2_UNORM:
+		return "HDR10 / BT.2100";
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:
+		return "scRGB, not supported by XeFG";
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+		return "SDR";
+	default:
+		return "unknown color space";
+	}
+}
+
+// XeFG stock network. libxess_fg.dll does not ship its multi frame variant (16), which Init would switch to for
+// more than one generated frame, so it gets forced. The XMX port publishes 16, and then Init loads the cheaper MFG
+// model: one optical flow field for the whole batch instead of one per generated frame
+
+FrameGenerator::Context::~Context()
+{
+	if (handle)
+	{
+		if (auto result = XeFG::Destroy(handle); result != XEFGD_RESULT_SUCCESS)
+			Log::Warn("XeFG Destroy error: {}", result);
+	}
+}
+
+static void XeFGLogCallback(const char* message, xefgd_logging_level_t level, void*)
+{
+	switch (level)
+	{
+	case XEFGD_LOGGING_LEVEL_ERROR:
+		Log::Error("XeFG: {}", message);
+		break;
+	case XEFGD_LOGGING_LEVEL_WARNING:
+		Log::Warn("XeFG: {}", message);
+		break;
+	default:
+		Log::Info("XeFG: {}", message);
+		break;
+	}
+}
+
+static ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, D3D12_RESOURCE_DESC desc,
+	D3D12_RESOURCE_STATES state, const wchar_t* name, const char* purpose)
+{
+	ComPtr<ID3D12Resource> texture;
+	D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+
+	if (HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+		IID_PPV_ARGS(&texture));
+		FAILED(hr))
+	{
+		// The desc is built from the game's resource, so it has to be in the message to identify the culprit
+		Log::Error("CreateCommittedResource error: {:X} for {}, {}x{}x{}, mips {}, format {}, flags {:X}, layout {}, samples {}/{}",
+			(uint32_t)hr, purpose, desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels,
+			(uint32_t)desc.Format, (uint32_t)desc.Flags, (uint32_t)desc.Layout, desc.SampleDesc.Count,
+			desc.SampleDesc.Quality);
+		return nullptr;
+	}
+
+	texture->SetName(name);
+	return texture;
+}
+
+// Depth copies become plain color textures where the format allows, anything can read those through SRVs
+static void MakeReadableDepth(D3D12_RESOURCE_DESC& desc)
+{
+	switch (desc.Format)
+	{
+	case DXGI_FORMAT_R32_TYPELESS:
+	case DXGI_FORMAT_D32_FLOAT:
+	case DXGI_FORMAT_R16_TYPELESS:
+	case DXGI_FORMAT_D16_UNORM:
+		desc.Format = TypedFormat(desc.Format);
+		desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		break;
+	default:
+		break;
+	}
+}
+
+// Copies source into copy, (re)created when the source changes, the copy is left in XeFGInputState
+static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose, bool isDepth = false)
+{
+	if (!source)
+	{
+		if (copy)
+			DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(copy)));
+		return false;
+	}
+
+	auto desc = source->GetDesc();
+
+	// The copy only ever rests in XeFGInputState and gets read through an SRV, so none of the source's flags are
+	// needed. Inheriting them can make CreateCommittedResource reject the desc: ALLOW_CROSS_ADAPTER needs a cross
+	// adapter heap, ALLOW_SIMULTANEOUS_ACCESS can't be combined with a depth resource, and ALLOW_UNORDERED_ACCESS
+	// can't be used with MSAA. A non committed layout (row major, 64KB swizzle) can be rejected the same way.
+	desc.Flags &= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+	if (isDepth)
+		MakeReadableDepth(desc);
+
+	if (copy)
+	{
+		auto copyDesc = copy->GetDesc();
+
+		// The old one can still be in use by the GPU
+		if (copyDesc.Dimension != desc.Dimension || copyDesc.Width != desc.Width || copyDesc.Height != desc.Height ||
+			copyDesc.DepthOrArraySize != desc.DepthOrArraySize || copyDesc.MipLevels != desc.MipLevels ||
+			copyDesc.Format != desc.Format || copyDesc.SampleDesc.Count != desc.SampleDesc.Count ||
+			copyDesc.SampleDesc.Quality != desc.SampleDesc.Quality || copyDesc.Layout != desc.Layout ||
+			copyDesc.Flags != desc.Flags)
+		{
+			DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(copy)));
+		}
+	}
+
+	if (!copy)
+		copy = CreateTexture(device, desc, XeFGInputState, L"dlssg-to-xefg input copy", purpose);
+
+	if (!copy)
+		return false;
+
+	Copy(cmdList, copy.Get(), XeFGInputState, source, sourceState);
+	return true;
+}
+
+static xefgd_resource_t Subrect(const NGXParameter& params, ID3D12Resource* resource,
+	const char* baseX, const char* baseY, const char* width, const char* height)
+{
+	xefgd_resource_t subrect{};
+	subrect.base = { params.GetOr<uint32_t>(baseX, 0), params.GetOr<uint32_t>(baseY, 0) };
+	subrect.size = { params.GetOr<uint32_t>(width, 0), params.GetOr<uint32_t>(height, 0) };
+
+	if (subrect.size.x == 0 || subrect.size.y == 0)
+	{
+		auto desc = resource->GetDesc();
+		subrect.base = {};
+		subrect.size = { (uint32_t)desc.Width, desc.Height };
+	}
+
+	return subrect;
+}
+
+static XMFLOAT3 GetVector(const NGXParameter& params, const char* name)
+{
+	auto key = [name](const char* axis) { return std::format("DLSSG.{}{}", name, axis); };
+	return { params.GetOr(key("X").c_str(), 0.0f), params.GetOr(key("Y").c_str(), 0.0f),
+			 params.GetOr(key("Z").c_str(), 0.0f) };
+}
+
+// XeFG's scene change detection uses the forward axis
+static void GetViewMatrix(const NGXParameter& params, float* out)
+{
+	const XMFLOAT3 pos = GetVector(params, "CameraPos");
+	const XMFLOAT3 right = GetVector(params, "CameraRight");
+	const XMFLOAT3 up = GetVector(params, "CameraUp");
+	const XMFLOAT3 forward = GetVector(params, "CameraFwd");
+
+	// All zero disables XeFG's scene change detection
+	if (forward.x == 0.0f && forward.y == 0.0f && forward.z == 0.0f)
+		return;
+
+	XMVECTOR p = XMLoadFloat3(&pos);
+	XMMATRIX view = { XMVectorSet(right.x, up.x, forward.x, 0.0f), XMVectorSet(right.y, up.y, forward.y, 0.0f),
+					  XMVectorSet(right.z, up.z, forward.z, 0.0f),
+					  XMVectorSet(-XMVectorGetX(XMVector3Dot(p, XMLoadFloat3(&right))),
+								  -XMVectorGetX(XMVector3Dot(p, XMLoadFloat3(&up))),
+								  -XMVectorGetX(XMVector3Dot(p, XMLoadFloat3(&forward))), 1.0f) };
+
+	memcpy(out, view.r, sizeof(view));
+}
+
+// Near/far/fov from a perspective view to clip matrix, dlssg-to-fsr3's approach. Near and far come out in depth
+// buffer order
+static bool CameraFromViewToClip(const NGXParameter& params, float& cameraNear, float& cameraFar, float& fov)
+{
+	float(*viewToClip)[4] = nullptr;
+	params.Get("DLSSG.CameraViewToClip", reinterpret_cast<void**>(&viewToClip));
+
+	if (params.GetOr<uint32_t>("DLSSG.OrthoProjection", 0) || !viewToClip)
+		return false;
+
+	// Some games (RTX Remix ones) pass zero or identity
+	float m[4][4] = {};
+	if (memcmp(viewToClip, m, sizeof(m)) == 0)
+		return false;
+
+	m[0][0] = m[1][1] = m[2][2] = m[3][3] = 1.0f;
+	if (memcmp(viewToClip, m, sizeof(m)) == 0)
+		return false;
+
+	const double b = viewToClip[1][1];
+	const double c = viewToClip[2][2];
+	const double d = viewToClip[3][2];
+	const double e = viewToClip[2][3];
+
+	if (e < 0.0)
+	{
+		cameraNear = (float)(c == 0.0 ? 0.0 : d / c);
+		cameraFar = (float)(d / (c + 1.0));
+	}
+	else
+	{
+		cameraNear = (float)(c == 0.0 ? 0.0 : -d / c);
+		cameraFar = (float)(-d / (c - 1.0));
+	}
+
+	fov = (float)(2.0 * std::atan(1.0 / b));
+
+	return cameraNear >= 0.0f && cameraFar >= 0.0f;
+}
+
+// Unreal's executables live in Binaries\<platform> and end with -Shipping
+static bool IsUnrealEngine()
+{
+	static const bool isUnreal = []
+		{
+			wchar_t path[MAX_PATH]{};
+			GetModuleFileNameW(nullptr, path, MAX_PATH);
+			_wcslwr_s(path);
+
+			std::wstring_view exe = path;
+			return exe.find(L"\\binaries\\win64\\") != exe.npos || exe.find(L"\\binaries\\wingdk\\") != exe.npos ||
+				exe.ends_with(L"-shipping.exe");
+		}();
+
+	return isUnreal;
+}
+
+// Left handed perspective matrix (row vectors) matching the depth buffer: inverted depth swaps near and far,
+// cameraFar == 0 means an infinite far plane
+static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, float aspectRatio, float* out)
+{
+	float cameraNear = 0.0f;
+	float cameraFar = 0.0f;
+	float fov = 0.0f;
+
+	// Unreal doesn't pass a correct CameraViewToClip, its separate camera values are fine
+	if (!IsUnrealEngine() && CameraFromViewToClip(params, cameraNear, cameraFar, fov))
+	{
+		if (depthInverted)
+			std::swap(cameraNear, cameraFar);
+	}
+	else
+	{
+		cameraNear = params.GetOr("DLSSG.CameraNear", 0.0f);
+		cameraFar = params.GetOr("DLSSG.CameraFar", 0.0f);
+		fov = params.GetOr("DLSSG.CameraFOV", 0.0f);
+
+		// Some games pass degrees, some radians
+		if (fov > 10.0f)
+			fov *= std::numbers::pi_v<float> / 180.0f;
+	}
+
+	if (float paramAspectRatio = params.GetOr("DLSSG.CameraAspectRatio", 0.0f); paramAspectRatio > 0.0f)
+		aspectRatio = paramAspectRatio;
+
+	if (cameraNear <= 0.0f || cameraFar < 0.0f || fov <= 0.0f || aspectRatio <= 0.0f)
+		return;
+
+	const bool infinite = cameraFar == 0.0f;
+	const float h = 1.0f / std::tan(fov * 0.5f);
+	const float w = h / aspectRatio;
+
+	// z_ndc = (a * z + b) / z
+	float a;
+	float b;
+
+	if (infinite)
+	{
+		a = depthInverted ? 0.0f : 1.0f;
+		b = depthInverted ? cameraNear : -cameraNear;
+	}
+	else
+	{
+		if (XMScalarNearEqual(cameraNear, cameraFar, 0.00001f))
+			cameraFar++;
+
+		const float range = cameraFar - cameraNear;
+		a = depthInverted ? -cameraNear / range : cameraFar / range;
+		b = depthInverted ? cameraNear * cameraFar / range : -cameraNear * cameraFar / range;
+	}
+
+	const float projection[16] = { w, 0, 0, 0, 0, h, 0, 0, 0, 0, a, 1, 0, 0, b, 0 };
+	memcpy(out, projection, sizeof(projection));
+}
+
+// The ported XMX MFG model is XeFG's XMX network. Without the program set XeFG keeps its default DP4a model.
+static bool PortAvailable()
+{
+	static const bool available = []
+		{
+			const bool installed = MfgKernels::Install(XeFG::Module());
+			Log::Info("Ported XMX MFG model available: {}", installed);
+			return installed;
+		}();
+
+	return available;
+}
+
+// XeFG's own XMX check decides: a context with no override picks the XMX network only on Intel GPUs whose driver
+// reports XMX. Probed once for the first device, before the first override, and kept for the menu's support state.
+static int32_t NativeModel(ID3D12Device* device)
+{
+	static const int32_t model = [device]
+		{
+			const int32_t picked = XeFG::AutoModel(device);
+
+			Plugin::xmxSupport = picked == XeFGXmxModel ? Plugin::XmxSupport::Supported : Plugin::XmxSupport::Unsupported;
+			Log::Info("XeFG model: {}", picked);
+			return picked;
+		}();
+
+	return model;
+}
+
+// Probes the GPU once, as early as a device is available: XeFG's own XMX network first, then the ported model and its
+// CUDA tensor-core route. The menu uses the flags to grey out paths that would fail, and the first context no longer
+// runs these checks. A later different device keeps the first device's answer, same as the native model probe.
+void FrameGenerator::ProbeSupport(ID3D12Device* device)
+{
+	if (!device)
+		return;
+
+	static std::once_flag once;
+	std::call_once(once, [device]
+		{
+			const int32_t native = NativeModel(device);
+
+			// XeFG's own XMX network works here; the port and its CUDA route are only needed when it doesn't.
+			if (native == XeFGXmxModel)
+			{
+				Plugin::cudaSupport = Plugin::CudaSupport::Unsupported;
+				Log::Info("XeFG native XMX network available, CUDA route not applicable");
+				return;
+			}
+
+			// Publishing the ported model patches libxess_fg.dll process wide. It's installed even when another path
+			// is selected, so the menu knows whether CUDA is available and switching paths needs no new context.
+			const bool mfgModel = MfgKernels::Install(XeFG::Module());
+			Plugin::cudaSupport = Plugin::CudaSupport::Unsupported;
+
+			if (!mfgModel)
+			{
+				Log::Info("Tensor-core route skipped: the ported MFG model is not available");
+				return;
+			}
+
+			wchar_t tensorCores[16]{};
+			const DWORD tensorCoresLength = GetEnvironmentVariableW(L"XEFG_TENSOR_CORES", tensorCores, 16);
+
+			if (tensorCoresLength && tensorCoresLength < 16 && (tensorCores[0] == L'0'
+				|| _wcsicmp(tensorCores, L"off") == 0 || _wcsicmp(tensorCores, L"false") == 0))
+			{
+				Log::Info("Tensor-core route disabled by XEFG_TENSOR_CORES");
+				return;
+			}
+
+			static std::once_flag cudaLogOnce;
+			std::call_once(cudaLogOnce, [] { xefg_cuda::SetLog(CudaRouteLog); });
+
+			const auto fatbin = LoadCudaFatbin(MfgKernels::ProgramsDirectory() / L"xefg_cuda_layers.fatbin");
+			std::string reason;
+			if (xefg_cuda::Install(device, XeFG::Module(), fatbin, reason))
+			{
+				Plugin::cudaSupport = Plugin::CudaSupport::Supported;
+				// The route's hooks stay installed, but only a context that selects CUDA turns Dispatch replacement on
+				xefg_cuda::SetEnabled(false);
+			}
+			else
+				Log::Info("Tensor-core route inactive: {}", reason);
+		});
+}
+
+static int32_t PickModel(ID3D12Device* device)
+{
+	const int32_t native = NativeModel(device);
+
+	switch (Plugin::options.path.load())
+	{
+	case Plugin::Path::Fallback:
+		return MfgKernels::Dp4aModel;
+	case Plugin::Path::XmxNative:
+		if (native == XeFGXmxModel)
+			return XeFGXmxModel;
+
+		// Unsupported, the CUDA / ported defaults below, the same as an unsupported CUDA choice
+		break;
+	case Plugin::Path::Cuda:
+	case Plugin::Path::XmxPort:
+		break;
+	}
+
+	return PortAvailable() ? MfgKernels::MfgModel : MfgKernels::Dp4aModel;
+}
+
+// The ported model runs on the CUDA tensor-core route when that's the selected path, otherwise on DXIL. XeFG's own
+// XMX network doesn't need the port at all.
+static bool UseCuda(int32_t model)
+{
+	if (model != MfgKernels::MfgModel)
+		return false;
+
+	const auto path = Plugin::options.path.load();
+	return path == Plugin::Path::Cuda || path == Plugin::Path::XmxNative;
+}
+
+static Plugin::Network CurrentNetwork(int32_t model)
+{
+	if (model == XeFGXmxModel)
+		return Plugin::Network::XmxNative;
+
+	if (model != MfgKernels::MfgModel)
+		return Plugin::Network::Fallback;
+
+	return xefg_cuda::Enabled() ? Plugin::Network::Cuda : Plugin::Network::XmxPort;
+}
+
+bool FrameGenerator::CreateContext()
+{
+	// Usually already done at NGX Init. Kept as a fallback when the game never called Init with a device.
+	ProbeSupport(device.Get());
+
+	auto newContext = std::make_shared<Context>();
+
+	// Publishing the ported model patches libxess_fg.dll process wide, so it runs before the first context. The probe
+	// already installed it when XeFG's own XMX network isn't available; this also covers a port path chosen later.
+	const bool mfgModel = settings.model != XeFGXmxModel && MfgKernels::Install(XeFG::Module());
+
+	if (!mfgModel && settings.model != XeFGXmxModel)
+	{
+		// The route runs the ported model, so without the port there's nothing for it to launch
+		Log::Info("Tensor-core route skipped: the ported MFG model is not available");
+	}
+
+	xefg_cuda::SetEnabled(UseCuda(settings.model));
+
+	// Process wide, they also affect other XeFG contexts. Must happen before the context picks its model
+	XeFG::SetMaxInterpolatedFrames(MaxFrames);
+	XeFG::OverrideModel(settings.model);
+
+	if (auto result = XeFG::CreateContext(device.Get(), &newContext->handle); result != XEFGD_RESULT_SUCCESS)
+	{
+		Log::Error("XeFG CreateContext error: {}", result);
+		return false;
+	}
+
+	XeFG::SetLoggingCallback(newContext->handle, XEFGD_LOGGING_LEVEL_INFO, XeFGLogCallback);
+
+	xefgd_init_params_t initParams{};
+	initParams.outputResolution = { settings.width, settings.height };
+	initParams.backBufferFormat = settings.format;
+	initParams.initFlags = settings.initFlags;
+	initParams.maxInterpolatedFrames = MaxFrames;
+	initParams.uiMode = settings.uiMode;
+
+	Log::Info("Creating XeFG context: {}x{}, format: {}, flags: {:X}, ui mode: {}, model: {}", settings.width,
+		settings.height, (uint32_t)settings.format, settings.initFlags, settings.uiMode, settings.model);
+
+	if (auto result = XeFG::Init(newContext->handle, initParams); result != XEFGD_RESULT_SUCCESS)
+	{
+		Log::Error("XeFG Init error: {}", result);
+		return false;
+	}
+
+	context = std::move(newContext);
+
+	routeLaunches = xefg_cuda::Snapshot().launches;
+	routeFrames = 0;
+	routeReported = false;
+	return true;
+}
+
+void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params)
+{
+	static bool warnedCameraMotion = false;
+	if (params.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) == 0 && !std::exchange(warnedCameraMotion, true))
+		Log::Warn("DLSSG.CameraMotionIncluded is 0, the camera's motion is missing from the motion vectors");
+
+	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
+	auto hudless = Plugin::options.hudlessUi ? params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr) : nullptr;
+	auto depth = params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr);
+	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
+	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
+
+	const bool depthInverted = params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
+
+	const auto backbufferFormat = TypedFormat(backbuffer->GetDesc().Format);
+	const auto hudlessFormat = hudless ? TypedFormat(hudless->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
+
+	Settings wanted;
+	auto outputDesc = output->GetDesc();
+	wanted.width = (uint32_t)outputDesc.Width;
+	wanted.height = outputDesc.Height;
+	wanted.format = TypedFormat(outputDesc.Format);
+	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
+		(params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
+	wanted.uiMode = hudless ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
+	wanted.model = PickModel(device.Get());
+
+	// The menu path can change without a context change: XMX Port and CUDA both run the ported model (16), only the
+	// route that executes its programs differs. Log the switch, and say whether it took effect below
+	const auto path = Plugin::options.path.load();
+	const bool pathChanged = (int32_t)path != loggedPath;
+
+	if (pathChanged)
+	{
+		loggedPath = (int32_t)path;
+		Log::Info("Network path: {}, model {}", Plugin::PathName(path), wanted.model);
+
+		// A switch can retry a context that failed to start
+		createFailed = false;
+	}
+
+	if (wanted != settings)
+	{
+		// Logged whenever the formats change, they decide whether XeFG's HDR path can work at all: HDR10 is
+		// R10G10B10A2_UNORM, scRGB is FP16 and unsupported, and the HDR inputs must all share one format
+		const auto describe = [](const char* name, DXGI_FORMAT format)
+			{
+				if (format == DXGI_FORMAT_UNKNOWN)
+					return std::format("{}: none", name);
+
+				return std::format("{}: {} ({}, {})", name, FormatName(format), (uint32_t)format, HdrDescription(format));
+			};
+
+		Log::Info("HDR formats, {}; {}; {}", describe("back buffer", backbufferFormat), describe("HUD-less", hudlessFormat),
+			describe("output", wanted.format));
+
+		if (backbufferFormat == DXGI_FORMAT_R16G16B16A16_FLOAT)
+			Log::Warn("FP16 (R16G16B16A16_FLOAT) is scRGB HDR, which XeFG doesn't support. Use HDR10 "
+				"(R10G10B10A2_UNORM) or turn HDR off, otherwise frame generation can fail or show wrong colors");
+		else if (hudlessFormat != DXGI_FORMAT_UNKNOWN && hudlessFormat != backbufferFormat)
+			Log::Warn("HUD-less color is {}, but the back buffer is {}, XeFG's HDR path needs every input in the same "
+				"HDR10 format", FormatName(hudlessFormat), FormatName(backbufferFormat));
+
+		settings = wanted;
+		createFailed = false;
+
+		if (context)
+			DeferredDestroy::Add(std::move(context));
+	}
+
+	if (!context && !createFailed)
+		createFailed = !CreateContext();
+
+	if (!context)
+		return;
+
+	xefg_cuda::SetEnabled(UseCuda(settings.model));
+	XeFG::SetDebugLines(Plugin::options.debugLines);
+
+	// After CreateContext: before it, the route has not been installed yet
+	if (pathChanged && path == Plugin::Path::Cuda)
+	{
+		const auto route = xefg_cuda::Snapshot();
+
+		if (route.state != xefg_cuda::State::Active)
+			Log::Warn("CUDA path selected, but the tensor-core route is unavailable ({}), the DXIL port runs instead",
+				route.reason.empty() ? std::string("not installed") : route.reason);
+	}
+
+	if (pathChanged && UseCuda(settings.model))
+	{
+		routeLaunches = xefg_cuda::Snapshot().launches;
+		routeFrames = 0;
+		routeReported = false;
+	}
+
+	context->current ^= 1;
+	auto& frame = context->frames[context->current];
+	auto& previous = context->frames[context->current ^ 1];
+
+	bool captured = Capture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer");
+	captured &= Capture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", true);
+	captured &= Capture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy");
+	const bool capturedHudless = Capture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy");
+	captured &= !hudless || capturedHudless;
+
+	auto& data = frame.data;
+	data = {};
+
+	if (captured)
+	{
+		data.backBuffer = Subrect(params, backbuffer,
+			"DLSSG.BackbufferSubrectBaseX", "DLSSG.BackbufferSubrectBaseY",
+			"DLSSG.BackbufferSubrectWidth", "DLSSG.BackbufferSubrectHeight");
+		data.depth = Subrect(params, depth,
+			"DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY",
+			"DLSSG.DepthSubrectWidth", "DLSSG.DepthSubrectHeight");
+		data.motionVectors = Subrect(params, mvecs,
+			"DLSSG.MVecsSubrectBaseX", "DLSSG.MVecsSubrectBaseY",
+			"DLSSG.MVecsSubrectWidth", "DLSSG.MVecsSubrectHeight");
+
+		if (hudless)
+			data.hudlessColor = Subrect(params, hudless,
+				"DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY",
+				"DLSSG.HUDLessSubrectWidth", "DLSSG.HUDLessSubrectHeight");
+	}
+
+	// The outputs are full size, XeFG writes its region at the back buffer's offset to keep letterboxing aligned
+	std::ranges::fill(context->outputBases, data.backBuffer.base);
+
+	GetViewMatrix(params, data.viewMatrix);
+	GetProjectionMatrix(params, depthInverted, (float)settings.width / (float)settings.height,
+		data.projectionMatrix);
+
+	data.outputResolution[0] = (float)settings.width;
+	data.outputResolution[1] = (float)settings.height;
+	data.jitterOffset[0] = params.GetOr("DLSSG.JitterOffsetX", 0.0f);
+	data.jitterOffset[1] = params.GetOr("DLSSG.JitterOffsetY", 0.0f);
+
+	// Unlike Streamline's constant, the NGX parameter already converts to pixels
+	data.motionVectorScale[0] = params.GetOr("DLSSG.MvecScaleX", 1.0f);
+	data.motionVectorScale[1] = params.GetOr("DLSSG.MvecScaleY", 1.0f);
+
+	if (data.motionVectorScale[0] == 0.0f || data.motionVectorScale[1] == 0.0f)
+		data.motionVectorScale[0] = data.motionVectorScale[1] = 1.0f;
+
+	const bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+	data.resetHistory = reset;
+
+	// XeFG needs both frames to have hudless or neither
+	context->pairValid = captured && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
+	frame.valid = captured;
+}
+
+FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_DESC outputDesc,
+	uint32_t frameIndex, uint32_t frameCount)
+{
+	if (!context || !context->pairValid)
+		return InterpolateResult::Skipped;
+
+	outputDesc.Format = settings.format;
+	outputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	// The game's output can live in a layout a committed UAV texture can't use
+	outputDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+	for (uint32_t i = 0; i < frameCount; i++)
+	{
+		if (!context->outputs[i])
+			context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
+				"XeFG output");
+
+		if (!context->outputs[i])
+			return InterpolateResult::Failed;
+	}
+
+	auto fill = [this](const Frame& frame, xefgd_frame_t& out)
+		{
+			out = frame.data;
+			out.backBuffer.pResource = frame.backbuffer.Get();
+			out.depth.pResource = frame.depth.Get();
+			out.motionVectors.pResource = frame.mvecs.Get();
+			out.hudlessColor.pResource = frame.hudless.Get();
+		};
+
+	xefgd_exec_params_t params{};
+	fill(context->frames[context->current ^ 1], params.prev);
+	fill(context->frames[context->current], params.next);
+
+	// XeFG wants the same array for every frame of a pair
+	static_assert(sizeof(ComPtr<ID3D12Resource>) == sizeof(ID3D12Resource*));
+	params.ppOutputs = reinterpret_cast<ID3D12Resource* const*>(context->outputs);
+	params.pOutputBases = context->outputBases;
+	params.numInterpolatedFrames = (uint8_t)frameCount;
+	params.uiCompositionEnabled = settings.uiMode != XEFGD_UI_MODE_AUTO;
+
+	// Frame 1 runs the per pair work and generates its frame, the rest only generate theirs
+	params.firstFrameIndex = frameIndex - 1;
+	params.frameCount = 1;
+
+	// Execute records the provider's dispatches into the caller's list; make sure that list's table is hooked too
+	if (UseCuda(settings.model))
+		xefg_cuda::Adopt(cmdList);
+
+	auto result = XeFG::Execute(context->handle, cmdList, params);
+
+	if (result == XEFGD_RESULT_SUCCESS)
+		return InterpolateResult::Interpolated;
+
+	if (result > 0)
+	{
+		// Warnings, like prev and next areas differing after a dynamic resolution change
+		Log::Debug("XeFG Execute warning: {}, frame {}/{}", result, frameIndex, frameCount);
+		return InterpolateResult::Skipped;
+	}
+
+	Log::Error("XeFG Execute error: {}, frame {}/{}", result, frameIndex, frameCount);
+	context->pairValid = false;
+	return InterpolateResult::Failed;
+}
+
+void FrameGenerator::InvalidateHistory()
+{
+	if (context)
+	{
+		context->pairValid = false;
+		context->frames[context->current].valid = false;
+	}
+}
+
+NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params)
+{
+	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
+	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
+	auto outputReal = params.GetOr<ID3D12Resource*>("DLSSG.OutputReal", nullptr);
+
+	if (!backbuffer || !output)
+	{
+		InvalidateHistory();
+		Log::Error("Missing backbuffer or output");
+		return NGX_FAIL_INVALID_PARAMETER;
+	}
+
+	if (outputReal)
+		Copy(cmdList, outputReal, OutputState, backbuffer, BackbufferState);
+
+	if (!params.GetOr<uint32_t>("DLSSG.EnableInterp", 1))
+	{
+		InvalidateHistory();
+
+		return NGX_SUCCESS;
+	}
+
+	if (!params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr) ||
+		!params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr))
+	{
+		InvalidateHistory();
+		Log::Error("Missing depth or motion vectors");
+		return NGX_FAIL_INVALID_PARAMETER;
+	}
+
+	// 1 based index of the generated frame and the number of generated frames between two real frames
+	const uint32_t frameCount = std::clamp(params.GetOr<uint32_t>("DLSSG.MultiFrameCount", 1), 1u, MaxFrames);
+	const uint32_t frameIndex = std::clamp(params.GetOr<uint32_t>("DLSSG.MultiFrameIndex", 1), 1u, frameCount);
+
+	if (frameIndex == 1)
+	{
+		CaptureRealFrame(cmdList, params);
+
+		Plugin::Report({ settings.width, settings.height, frameCount, settings.uiMode != XEFGD_UI_MODE_AUTO,
+			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
+	}
+
+	const auto result = Interpolate(cmdList, output->GetDesc(), frameIndex, frameCount);
+
+	// A few frames after the path or context changed, say whether the tensor-core route is actually the one running
+	if (result == InterpolateResult::Interpolated && UseCuda(settings.model) && !routeReported && ++routeFrames >= 8)
+	{
+		routeReported = true;
+		const auto route = xefg_cuda::Snapshot();
+
+		if (route.launches > routeLaunches)
+			Log::Info("CUDA route: {} tensor-core kernels launched ({} layer binds, {} layers recognized)",
+				route.launches - routeLaunches, route.binds, route.layers);
+		else
+			Log::Warn("CUDA route: no tensor-core kernel launched ({} layer binds, {} layers recognized), the DXIL port is running",
+				route.binds, route.layers);
+	}
+
+	// Without a usable pair (first frame, reset) the real frame is shown again, that's not an error
+	if (result == InterpolateResult::Interpolated)
+		Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
+	else
+		Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
+
+	return result == InterpolateResult::Failed ? NGX_FAIL : NGX_SUCCESS;
+}
