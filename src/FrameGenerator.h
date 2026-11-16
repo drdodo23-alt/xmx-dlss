@@ -63,6 +63,8 @@ private:
 
 		// The previous and the current real frame can be interpolated
 		bool pairValid = false;
+		uint32_t batchFrameCount = 0;
+		uint32_t nextFrameIndex = 1;
 
 		~Context();
 	};
