@@ -219,7 +219,7 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
 	return true;
 }
 
-static xefgd_resource_t Subrect(const NGXParameter& params, ID3D12Resource* resource,
+static xefgd_resource_t Subrect(const NGXParameter& params, const D3D12_RESOURCE_DESC& desc,
 	const char* baseX, const char* baseY, const char* width, const char* height)
 {
 	xefgd_resource_t subrect{};
@@ -228,12 +228,24 @@ static xefgd_resource_t Subrect(const NGXParameter& params, ID3D12Resource* reso
 
 	if (subrect.size.x == 0 || subrect.size.y == 0)
 	{
-		auto desc = resource->GetDesc();
 		subrect.base = {};
 		subrect.size = { (uint32_t)desc.Width, desc.Height };
 	}
 
 	return subrect;
+}
+
+static bool RegionFits(const xefgd_resource_t& region, const D3D12_RESOURCE_DESC& desc)
+{
+	return region.size.x != 0 && region.size.y != 0 &&
+		uint64_t{ region.base.x } + region.size.x <= desc.Width &&
+		uint64_t{ region.base.y } + region.size.y <= desc.Height;
+}
+
+static void LogRegion(const char* name, const xefgd_resource_t& region, const D3D12_RESOURCE_DESC& desc)
+{
+	Log::Info("FG input {}: texture={}x{} format={} region=({}, {}) {}x{}", name, desc.Width, desc.Height,
+		static_cast<uint32_t>(desc.Format), region.base.x, region.base.y, region.size.x, region.size.y);
 }
 
 static XMFLOAT3 GetVector(const NGXParameter& params, const char* x, const char* y, const char* z)
@@ -578,8 +590,12 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	const bool depthInverted = params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
 
-	const auto backbufferFormat = TypedFormat(backbuffer->GetDesc().Format);
-	const auto hudlessFormat = hudless ? TypedFormat(hudless->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
+	const auto backbufferDesc = backbuffer->GetDesc();
+	const auto depthDesc = depth->GetDesc();
+	const auto motionDesc = mvecs->GetDesc();
+	const auto hudlessDesc = hudless ? hudless->GetDesc() : D3D12_RESOURCE_DESC{};
+	const auto backbufferFormat = TypedFormat(backbufferDesc.Format);
+	const auto hudlessFormat = TypedFormat(hudlessDesc.Format);
 
 	Settings wanted;
 	auto outputDesc = output->GetDesc();
@@ -675,18 +691,18 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	if (captured)
 	{
-		data.backBuffer = Subrect(params, backbuffer,
+		data.backBuffer = Subrect(params, backbufferDesc,
 			"DLSSG.BackbufferSubrectBaseX", "DLSSG.BackbufferSubrectBaseY",
 			"DLSSG.BackbufferSubrectWidth", "DLSSG.BackbufferSubrectHeight");
-		data.depth = Subrect(params, depth,
+		data.depth = Subrect(params, depthDesc,
 			"DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY",
 			"DLSSG.DepthSubrectWidth", "DLSSG.DepthSubrectHeight");
-		data.motionVectors = Subrect(params, mvecs,
+		data.motionVectors = Subrect(params, motionDesc,
 			"DLSSG.MVecsSubrectBaseX", "DLSSG.MVecsSubrectBaseY",
 			"DLSSG.MVecsSubrectWidth", "DLSSG.MVecsSubrectHeight");
 
 		if (hudless)
-			data.hudlessColor = Subrect(params, hudless,
+			data.hudlessColor = Subrect(params, hudlessDesc,
 				"DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY",
 				"DLSSG.HUDLessSubrectWidth", "DLSSG.HUDLessSubrectHeight");
 	}
@@ -704,18 +720,36 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	data.jitterOffset[1] = params.GetOr("DLSSG.JitterOffsetY", 0.0f);
 
 	// Unlike Streamline's constant, the NGX parameter already converts to pixels
-	data.motionVectorScale[0] = params.GetOr("DLSSG.MvecScaleX", 1.0f);
-	data.motionVectorScale[1] = params.GetOr("DLSSG.MvecScaleY", 1.0f);
-
-	if (data.motionVectorScale[0] == 0.0f || data.motionVectorScale[1] == 0.0f)
-		data.motionVectorScale[0] = data.motionVectorScale[1] = 1.0f;
+	const float scaleX = params.GetOr("DLSSG.MvecScaleX", 1.0f);
+	const float scaleY = params.GetOr("DLSSG.MvecScaleY", 1.0f);
+	data.motionVectorScale[0] = scaleX == 0.0f ? 1.0f : scaleX;
+	data.motionVectorScale[1] = scaleY == 0.0f ? 1.0f : scaleY;
 
 	const bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
 	data.resetHistory = reset;
 
+	const bool validInputs = captured && std::isfinite(scaleX) && std::isfinite(scaleY) &&
+		RegionFits(data.backBuffer, backbufferDesc) && RegionFits(data.backBuffer, outputDesc) &&
+		RegionFits(data.depth, depthDesc) && RegionFits(data.motionVectors, motionDesc) &&
+		(!hudless || RegionFits(data.hudlessColor, hudlessDesc));
+	// Periodic snapshots are useful when visual artifacts do not trigger provider warnings.
+	if (context->captures++ % 300 == 0 || context->lastInputsValid != validInputs)
+	{
+		Log::Info("FG input snapshot: capture={} valid={} reset={} flags={:X} MV scale raw=({}, {}) applied=({}, {}) jitter=({}, {})",
+			context->captures, validInputs, reset, settings.initFlags, scaleX, scaleY, data.motionVectorScale[0],
+			data.motionVectorScale[1], data.jitterOffset[0], data.jitterOffset[1]);
+		LogRegion("backbuffer", data.backBuffer, backbufferDesc);
+		LogRegion("interpolated output", data.backBuffer, outputDesc);
+		LogRegion("depth", data.depth, depthDesc);
+		LogRegion("motion vectors", data.motionVectors, motionDesc);
+		if (hudless)
+			LogRegion("HUD-less", data.hudlessColor, hudlessDesc);
+	}
+	context->lastInputsValid = validInputs;
+
 	// XeFG needs both frames to have hudless or neither
-	context->pairValid = captured && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
-	frame.valid = captured;
+	context->pairValid = validInputs && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
+	frame.valid = validInputs;
 }
 
 FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_DESC outputDesc,
